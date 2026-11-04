@@ -2,6 +2,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
+const { calculatePrivacyLeakageScore, calculateAggregateRiskSummary } = require('./privacy-score');
 
 const ROOT = path.resolve(__dirname, '..');
 const DATA = path.join(ROOT, 'dataset');
@@ -161,9 +162,17 @@ class Ghostprints {
     return index;
   }
   analyze(req) {
-    if (!deletionIntent(req.request_text)) return { case_id:req.case_id, deletion_status:'NOT_APPLICABLE', steps:[], explanation:'Request text does not clearly authorize deletion.' };
+    if (!deletionIntent(req.request_text)) {
+      const res = { case_id:req.case_id, deletion_status:'NOT_APPLICABLE', steps:[], explanation:'Request text does not clearly authorize deletion.' };
+      res.privacy_score = calculatePrivacyLeakageScore(res, req, this.manifest);
+      return res;
+    }
     const matches = [...this.identities.values()].filter(p => p.identifiers.has(norm(req.email)));
-    if (matches.length !== 1) return { case_id:req.case_id, deletion_status:'INCOMPLETE', steps:[], explanation:matches.length ? 'Identity is ambiguous; findings were not merged.' : 'No unique identity profile could be resolved.' , identity_ambiguous: matches.length > 1 };
+    if (matches.length !== 1) {
+      const res = { case_id:req.case_id, deletion_status:'INCOMPLETE', steps:[], explanation:matches.length ? 'Identity is ambiguous; findings were not merged.' : 'No unique identity profile could be resolved.' , identity_ambiguous: matches.length > 1 };
+      res.privacy_score = calculatePrivacyLeakageScore(res, req, this.manifest);
+      return res;
+    }
     const profile = matches[0]; const cutoff = iso(req.audit_at); const found = [];
     for (const observation of this.observationIndex.get(profile.user_id)||[]) {
       const e=observation.evidence;if(iso(e.captured_at)>cutoff)continue;
@@ -203,12 +212,20 @@ class Ghostprints {
         const line = file.text.split(/\r?\n/).find(x => norm(x).includes(norm(req.email)) && /NOT_FOUND|ANONYMIZED|REDACTED|BLOCKED|DISABLED/i.test(x));
         if (line) { const m=line.match(/\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|/); if(m) steps.push(makeStep('VERIFICATION',m[1].trim(),m[2].trim(),'VERIFY_RECORD_ABSENT','ABSENT',file.file_id)); }
       }
-      if(!steps.length) return { case_id:req.case_id, deletion_status:'INCOMPLETE', steps:[], explanation:'No policy-compliant verification evidence established the final state by the audit cutoff.', missing_evidence:true };
+      if(!steps.length) {
+        const res = { case_id:req.case_id, deletion_status:'INCOMPLETE', steps:[], explanation:'No policy-compliant verification evidence established the final state by the audit cutoff.', missing_evidence:true };
+        res.privacy_score = calculatePrivacyLeakageScore(res, req, this.manifest);
+        return res;
+      }
     } else {
-      return { case_id:req.case_id, deletion_status:'INCOMPLETE', steps:[], explanation:'Evidence for this identity is missing or unreadable by the audit cutoff; absence cannot be verified.', missing_evidence:true };
+      const res = { case_id:req.case_id, deletion_status:'INCOMPLETE', steps:[], explanation:'Evidence for this identity is missing or unreadable by the audit cutoff; absence cannot be verified.', missing_evidence:true };
+      res.privacy_score = calculatePrivacyLeakageScore(res, req, this.manifest);
+      return res;
     }
     sortSteps(steps); steps.forEach((s,i)=>s.step_no=i+1);
-    return { case_id:req.case_id, deletion_status:incomplete?'INCOMPLETE':'COMPLETE', steps, explanation:incomplete?`${steps.filter(s=>s.phase==='FINDING').length} evidence-linked residual identifier occurrence(s) were found.`:'No direct evidence match was found in the readable evidence available by the audit cutoff; this is not, by itself, proof of absence.' };
+    const res = { case_id:req.case_id, deletion_status:incomplete?'INCOMPLETE':'COMPLETE', steps, explanation:incomplete?`${steps.filter(s=>s.phase==='FINDING').length} evidence-linked residual identifier occurrence(s) were found.`:'No direct evidence match was found in the readable evidence available by the audit cutoff; this is not, by itself, proof of absence.' };
+    res.privacy_score = calculatePrivacyLeakageScore(res, req, this.manifest);
+    return res;
   }
   systemFor(resource, context='') {
     const map = [['account','account_service'],['search','search_service'],['support','support_platform'],['analytics','analytics_platform'],['telemetry','analytics_platform'],['export','export_service'],['backup','backup_service'],['audit_record','security_service'],['data_flow','integration_service'],['cache','cache_service'],['archive','archive_service']];
@@ -217,10 +234,44 @@ class Ghostprints {
   policyAction(category) { return this.rules.find(r=>r.data_category.toUpperCase()===String(category).toUpperCase())?.required_action.toUpperCase()||''; }
   all() { return this.requests.map(r=>this.results.get(r.case_id)||this.analyze(r)); }
   run() { for (const r of this.requests) this.results.set(r.case_id,this.analyze(r)); return this.all(); }
+  score(case_id, customConfig) {
+    let r = this.requests.find(x => x.case_id === case_id);
+    let isSample = false;
+    if (!r) {
+      r = this.sample.find(x => x.case_id === case_id);
+      isSample = true;
+    }
+    if (!r) return null;
+    let c = this.results.get(case_id);
+    if (!c) {
+      c = this.analyze(r);
+      if (!isSample) this.results.set(case_id, c);
+    }
+    return calculatePrivacyLeakageScore(c, r, this.manifest, customConfig);
+  }
+  risksSummary() {
+    return calculateAggregateRiskSummary(this.all(), this.requests, this.manifest);
+  }
   dashboard() {
     const cases=this.all(); const counts={COMPLETE:0,INCOMPLETE:0,NOT_APPLICABLE:0}; cases.forEach(c=>counts[c.deletion_status]++);
     const findings=cases.flatMap(c=>c.steps.filter(s=>s.phase==='FINDING'));
-    return { total_requests:cases.length, completed:counts.COMPLETE, incomplete:counts.INCOMPLETE, not_applicable:counts.NOT_APPLICABLE, remaining_records:findings.length, active_flows:findings.filter(x=>x.operation==='REPORT_ACTIVE_DATA_FLOW').length, restore_risks:findings.filter(x=>x.operation==='REPORT_RESTORE_RISK').length, by_system:Object.fromEntries([...new Set(findings.map(f=>f.system_id))].map(s=>[s,findings.filter(f=>f.system_id===s).length])), recent:cases.slice(-10) };
+    const riskSummary = this.risksSummary();
+    return {
+      total_requests: cases.length,
+      completed: counts.COMPLETE,
+      incomplete: counts.INCOMPLETE,
+      not_applicable: counts.NOT_APPLICABLE,
+      remaining_records: findings.length,
+      active_flows: findings.filter(x=>x.operation==='REPORT_ACTIVE_DATA_FLOW').length,
+      restore_risks: findings.filter(x=>x.operation==='REPORT_RESTORE_RISK').length,
+      by_system: Object.fromEntries([...new Set(findings.map(f=>f.system_id))].map(s=>[s,findings.filter(f=>f.system_id===s).length])),
+      recent: cases.slice(-10),
+      average_privacy_score: riskSummary.average_score,
+      risk_distribution: riskSummary.risk_distribution,
+      critical_cases_count: riskSummary.risk_distribution.CRITICAL,
+      high_cases_count: riskSummary.risk_distribution.HIGH,
+      system_exposure: riskSummary.system_exposure.slice(0, 8),
+    };
   }
   export() {
     const rows=this.all().slice().sort((a,b)=>a.case_id.localeCompare(b.case_id));
@@ -237,23 +288,73 @@ const server = http.createServer((req,res)=>{
   const json=(code,value)=>{res.writeHead(code,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(value));};
   if(url.pathname==='/api/health') return json(200,{status:'ok',product:'GHOSTPRINTS',requests:app.requests.length,evidence_files:app.manifest.length});
   if(url.pathname==='/api/dashboard/summary') return json(200,app.dashboard());
+  if(url.pathname==='/api/risks/summary') return json(200,app.risksSummary());
+  if(url.pathname==='/api/risks/comparison') {
+    const caseIds = (url.searchParams.get('cases') || '').split(',').map(s=>s.trim()).filter(Boolean);
+    const comparison = caseIds.map(id => app.score(id)).filter(Boolean);
+    return json(200, { requested_cases: caseIds, items: comparison });
+  }
+  if(url.pathname==='/api/risks/export') {
+    const format = url.searchParams.get('format') || 'csv';
+    const allScores = app.requests.map(r => app.score(r.case_id)).filter(Boolean);
+    if (format === 'json') {
+      res.writeHead(200, {'Content-Type':'application/json; charset=utf-8', 'Content-Disposition':'attachment; filename="privacy_risk_report.json"'});
+      return res.end(JSON.stringify(allScores, null, 2));
+    }
+    const headers = ['case_id','email','investigation_status','privacy_leakage_score','risk_level','evidence_sufficiency','direct_identifiers_score','sensitive_info_score','active_flows_score','backup_exposure_score','system_spread_score','affected_systems','evidence_ids'];
+    const csvRows = [headers.join(',')];
+    for (const s of allScores) {
+      const req = app.requests.find(r => r.case_id === s.case_id) || {};
+      csvRows.push([
+        s.case_id,
+        esc(req.email || ''),
+        s.investigation_status,
+        s.total_score,
+        s.risk_level,
+        s.evidence_sufficiency,
+        s.categories?.direct_identifiers?.score || 0,
+        s.categories?.sensitive_info?.score || 0,
+        s.categories?.active_flows?.score || 0,
+        s.categories?.backup_exposure?.score || 0,
+        s.categories?.system_spread?.score || 0,
+        esc((s.affected_systems || []).join('; ')),
+        esc((s.supporting_evidence_ids || []).join('; '))
+      ].join(','));
+    }
+    res.writeHead(200, {'Content-Type':'text/csv; charset=utf-8', 'Content-Disposition':'attachment; filename="privacy_risk_report.csv"'});
+    return res.end(csvRows.join('\n') + '\n');
+  }
   if(url.pathname==='/api/datasets') return json(200,[{dataset_id:'official-challenge',request_count:app.requests.length,evidence_count:app.manifest.length,files:app.manifest}]);
   if(url.pathname==='/api/datasets/official-challenge') return json(200,{dataset_id:'official-challenge',request_count:app.requests.length,evidence_count:app.manifest.length,manifest:app.manifest,missing:app.manifest.filter(f=>!f.readable)});
   if(url.pathname==='/api/investigations/run' && req.method==='POST') return json(200,{processed:app.requests.length,results:app.run().length});
   if(url.pathname==='/api/investigations') {
-    const q=norm(url.searchParams.get('q')||''); const status=url.searchParams.get('status');
-    const out=app.all().filter(c=>{const r=app.requests.find(x=>x.case_id===c.case_id); return (!status||c.deletion_status===status)&&(!q||norm([c.case_id,r?.email,r?.request_text].join(' ')).includes(q));});
+    const q=norm(url.searchParams.get('q')||''); const status=url.searchParams.get('status'); const riskLevel=url.searchParams.get('risk');
+    const out=app.all().map(c=>({...c,request:app.requests.find(x=>x.case_id===c.case_id),privacy_score:c.privacy_score||app.score(c.case_id)})).filter(c=>{
+      const r=c.request;
+      const matchesStatus = !status || c.deletion_status===status;
+      const matchesRisk = !riskLevel || c.privacy_score?.risk_level === riskLevel;
+      const matchesQ = !q || norm([c.case_id, r?.email, r?.request_text, c.privacy_score?.risk_level, c.privacy_score?.risk_label].join(' ')).includes(q);
+      return matchesStatus && matchesRisk && matchesQ;
+    });
+    const sortBy = url.searchParams.get('sort');
+    if (sortBy === 'score_desc') out.sort((a,b)=>(b.privacy_score?.total_score||0)-(a.privacy_score?.total_score||0));
+    else if (sortBy === 'score_asc') out.sort((a,b)=>(a.privacy_score?.total_score||0)-(b.privacy_score?.total_score||0));
     const offset=Math.max(0,Number(url.searchParams.get('offset')||0)); const limit=Math.min(100,Math.max(1,Number(url.searchParams.get('limit')||25)));
     return json(200,{total:out.length,items:out.slice(offset,offset+limit)});
   }
   if(parts[0]==='api'&&parts[1]==='investigations'&&parts[2]) {
-    const c=app.all().find(x=>x.case_id===parts[2]); if(!c) return json(404,{error:'Case not found'});
-    if(parts[3]==='evidence') return json(200,{case_id:c.case_id,items:c.steps.map(s=>s.evidence_id).filter(Boolean).map(id=>app.manifest.find(f=>f.file_id===id)).filter(Boolean)});
-    if(parts[3]==='timeline') return json(200,{case_id:c.case_id,request:app.requests.find(x=>x.case_id===c.case_id),steps:c.steps});
-    if(parts[3]==='graph') return json(200,{nodes:c.steps.map(s=>({id:s.resource_id,label:s.resource_id,system_id:s.system_id,state:s.state,evidence_id:s.evidence_id})),edges:[]});
-    if(parts[3]==='risks') return json(200,c.steps.filter(s=>s.phase==='FINDING'));
-    if(parts[3]==='remediation') return json(200,c.steps.filter(s=>s.phase!=='FINDING'));
-    return json(200,{...c,request:app.requests.find(x=>x.case_id===c.case_id)});
+    const c=app.all().find(x=>x.case_id===parts[2]) || app.sample.find(x=>x.case_id===parts[2]);
+    if(!c) return json(404,{error:'Case not found'});
+    const analysis = app.results.get(c.case_id) || app.analyze(c);
+    if(parts[3]==='evidence') return json(200,{case_id:c.case_id,items:analysis.steps.map(s=>s.evidence_id).filter(Boolean).map(id=>app.manifest.find(f=>f.file_id===id)).filter(Boolean)});
+    if(parts[3]==='timeline') return json(200,{case_id:c.case_id,request:app.requests.find(x=>x.case_id===c.case_id)||app.sample.find(x=>x.case_id===c.case_id),steps:analysis.steps});
+    if(parts[3]==='graph') return json(200,{nodes:analysis.steps.map(s=>({id:s.resource_id,label:s.resource_id,system_id:s.system_id,state:s.state,evidence_id:s.evidence_id})),edges:[]});
+    if(parts[3]==='risks') {
+      if(url.searchParams.get('raw')==='true') return json(200,analysis.steps.filter(s=>s.phase==='FINDING'));
+      return json(200, app.score(c.case_id));
+    }
+    if(parts[3]==='remediation') return json(200,analysis.steps.filter(s=>s.phase!=='FINDING'));
+    return json(200,{...analysis,request:app.requests.find(x=>x.case_id===c.case_id)||app.sample.find(x=>x.case_id===c.case_id),privacy_score:app.score(c.case_id)});
   }
   if(url.pathname==='/api/reports/export') { const body=app.export(); res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="output.csv"'}); return res.end(body); }
   if(url.pathname==='/api/evidence') return json(200,app.manifest);
